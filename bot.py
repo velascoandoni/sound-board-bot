@@ -370,6 +370,10 @@ class ActiveSoundsList:
             await self.update()
 
         return removed
+    
+    async def remove_all_and_update(self) -> bool:
+        self.sounds.clear()
+        await self.update()
 
 active_sounds_list= ActiveSoundsList()
 # ---------------------------------------------------------------------------
@@ -423,7 +427,8 @@ async def play_sound(interaction: discord.Interaction, key: str):
                 await vc.move_to(member.voice.channel)
             mixer = await get_mixer(guild, vc)
         sound_id= await active_sounds_list.add_and_update(sound)
-        
+        loop = asyncio.get_running_loop()
+
         async def on_finished():
             await active_sounds_list.remove_and_update(sound_id)
         def schedule_on_finished():
@@ -462,6 +467,8 @@ class StopButton(discord.ui.Button):
         mixer = mixers.get(interaction.guild.id)
         if mixer:
             mixer.stop_all()
+        if active_sounds_list:
+            await active_sounds_list.remove_all_and_update()
         await interaction.response.defer()  # silent acknowledge
 
 
