@@ -256,28 +256,12 @@ class SoundRow:
     user_id: int
     duration_seconds: float
     emoji: str = "🔊"
-    started_at: float = field(default_factory=time.monotonic)
 
-    @property
-    def elapsed_seconds(self) -> int:
-        now = datetime.now(timezone.utc)
-        return max(0, int((now - self.started_at).total_seconds()))
-
-    @property
-    def remaining_seconds(self) -> int:
-        elapsed = time.monotonic() - self.started_at
-        return max(0, math.ceil(self.duration_seconds - elapsed))
-
-    def format_duration(self) -> str:
-        seconds = self.remaining_seconds
-        minutes, seconds = divmod(seconds, 60)
-        return f"{minutes:02d}:{seconds:02d}"
 
     def to_string(self) -> str:
         return (
             f"{self.emoji} **{self.name}**\n"
-            f"└  Played by <@{self.user_id}> · "
-            f"`{self.format_duration()}`"
+            f"└  Played by <@{self.user_id}>"
         )
 
 
@@ -297,25 +281,6 @@ class ActiveSoundsList:
 
         self.message: Optional[discord.Message] = None
         self._refresh_task: Optional[asyncio.Task] = None
-
-    async def _refresh_remaining(self):
-        loop = asyncio.get_running_loop()
-        interval = 1.0
-        next_tick = loop.time() + interval
-
-        try:
-            while self.sounds:
-                await asyncio.sleep(max(0, next_tick - loop.time()))
-
-                if self.sounds:
-                    await self.update()
-
-                next_tick += interval
-                now = loop.time()
-                if next_tick <= now:
-                    next_tick = now + interval
-        finally:
-            self._refresh_task = None
 
     def add_sound(
         self,
@@ -400,9 +365,6 @@ class ActiveSoundsList:
         sound_id=str(datetime.now().timestamp())+sound[0]
         self.add_sound(sound_id, sound[0],user_id,duration_seconds,sound[2])
         await self.update()
-        
-        if self._refresh_task is None or self._refresh_task.done():
-            self._refresh_task = asyncio.create_task(self._refresh_remaining())
         return sound_id
 
     async def remove_and_update(self, sound_id: str) -> bool:
