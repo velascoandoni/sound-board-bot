@@ -67,8 +67,7 @@ SOUNDS = load_json(SOUNDS_FILE, {})  # emoji -> [label, filename]
 def find_sound(emoji: str):
     for e, v in SOUNDS.items():
         if norm(e) == norm(emoji):
-            v.append(e)
-            return v
+            return [*v, e]
     return None
 
 
@@ -418,7 +417,6 @@ class ActiveSoundsList:
         self.sounds.clear()
         await self.update()
 
-active_sounds_list= ActiveSoundsList()
 # ---------------------------------------------------------------------------
 # Bot + buttons
 # ---------------------------------------------------------------------------
@@ -459,22 +457,26 @@ async def play_sound(interaction: discord.Interaction, key: str):
     await interaction.response.defer()
 
     guild = interaction.guild
+    activity_list = active_sounds_lists.get(guild.id)
+    if activity_list is None:
+        return await interaction.followup.send(
+            "Run /setup before playing sounds.", ephemeral=True
+        )
+
     try:
         async with voice_locks.setdefault(guild.id, asyncio.Lock()):
             vc = guild.voice_client
             if vc is None:
                 vc = await member.voice.channel.connect()
-                entry=load_json(STATE_FILE, {}).get(str(guild.id))
-                await active_sounds_list.send(bot.get_channel(entry["channel_id"]))
             elif vc.channel != member.voice.channel:
                 await vc.move_to(member.voice.channel)
             mixer = await get_mixer(guild, vc)
         duration_seconds = await get_audio_duration(path)
-        sound_id= await active_sounds_list.add_and_update(sound,duration_seconds,member.id)
+        sound_id= await activity_list.add_and_update(sound,duration_seconds,member.id)
         loop = asyncio.get_running_loop()
 
         async def on_finished():
-            await active_sounds_list.remove_and_update(sound_id)
+            await activity_list.remove_and_update(sound_id)
         def schedule_on_finished():
             asyncio.run_coroutine_threadsafe(on_finished(), loop)
         await asyncio.to_thread(mixer.add_sound, path,on_finished=schedule_on_finished)
@@ -511,16 +513,17 @@ class StopButton(discord.ui.Button):
         mixer = mixers.get(interaction.guild.id)
         if mixer:
             mixer.stop_all()
-        if active_sounds_list:
-            await active_sounds_list.remove_all_and_update()
+        activity_list = active_sounds_lists.get(interaction.guild.id)
+        if activity_list:
+            await activity_list.remove_all_and_update()
         await interaction.response.defer()  # silent acknowledge
 
 
 def build_view():
     view = discord.ui.View(timeout=None)  # timeout=None -> buttons never expire
     view.add_item(StopButton())
-    for key, (label, _filename) in SOUNDS.items():
-        view.add_item(SoundButton(key, label))
+    for key, sound_data in SOUNDS.items():
+        view.add_item(SoundButton(key, sound_data[0]))
     return view
 
 
@@ -533,12 +536,37 @@ class SoundBot(discord.Client):
 
     async def setup_hook(self):
         await self.tree.sync()
-        # Re-attach the buttons of existing soundboard messages after a restart
-        for entry in load_json(STATE_FILE, {}).values():
-            self.add_view(build_view(), message_id=entry["message_id"])
+        for guild_id, entry in load_json(STATE_FILE, {}).items():
+            buttons_message = entry.get("buttons-message")
+            if buttons_message is None and "message_id" in entry:
+                buttons_message = entry
+            if buttons_message:
+                self.add_view(
+                    build_view(),
+                    message_id=buttons_message["message_id"],
+                )
+
+            activity_message = entry.get("activity-message")
+            if activity_message:
+                try:
+                    channel = self.get_channel(activity_message["channel_id"])
+                    if channel is None:
+                        channel = await self.fetch_channel(
+                            activity_message["channel_id"]
+                        )
+                    activity_list = ActiveSoundsList()
+                    activity_list.message = channel.get_partial_message(
+                        activity_message["message_id"]
+                    )
+                    active_sounds_lists[int(guild_id)] = activity_list
+                except discord.HTTPException as err:
+                    print(f"Could not restore activity message: {err}")
 
 
 bot = SoundBot()
+
+
+active_sounds_lists = {}
 
 
 async def update_board(entry):
@@ -553,10 +581,13 @@ async def update_board(entry):
 async def refresh_boards(skip_message_id=None):
     """Update the soundboard message in every server."""
     for entry in load_json(STATE_FILE, {}).values():
-        if entry["message_id"] == skip_message_id:
+        buttons_message = entry.get("buttons-message")
+        if buttons_message is None and "message_id" in entry:
+            buttons_message = entry
+        if not buttons_message or buttons_message["message_id"] == skip_message_id:
             continue
         try:
-            await update_board(entry)
+            await update_board(buttons_message)
         except discord.HTTPException as err:
             print(f"Could not refresh board: {err}")
 
@@ -581,32 +612,82 @@ async def setup(interaction: discord.Interaction):
             topic="Upload an mp3/wav/ogg. Write an emoji (and optional name) in the message.",
         )
 
-    old = state.get(str(guild.id))
-    if old and guild.get_channel(old["channel_id"]):
-        ch = guild.get_channel(old["channel_id"])
-        # Convert an existing reaction-based board to buttons (and re-sync it)
+    old = state.get(str(guild.id), {})
+    buttons_message = old.get("buttons-message")
+    if buttons_message is None and "channel_id" in old:
+        buttons_message = {
+            "channel_id": old["channel_id"],
+            "message_id": old["message_id"],
+        }
+
+    channel = (
+        guild.get_channel(buttons_message["channel_id"])
+        if buttons_message
+        else None
+    )
+    if channel is None:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=True, read_message_history=True, send_messages=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True),
+        }
+        channel = await guild.create_text_channel(
+            "soundboard", overwrites=overwrites,
+            topic="Join a voice channel, then press a button to play a sound.")
+
+    if buttons_message and buttons_message["channel_id"] == channel.id:
         try:
-            await update_board(old)
-            msg = await ch.fetch_message(old["message_id"])
-            await msg.clear_reactions()
+            await update_board(buttons_message)
+            old_buttons = await channel.fetch_message(buttons_message["message_id"])
+            await old_buttons.clear_reactions()
         except discord.HTTPException as err:
             print(f"Could not update existing board: {err}")
-        return await interaction.followup.send(
-            f"Soundboard: {ch.mention} | Uploads: {add_ch.mention}")
+            board = await channel.send(board_text(), view=build_view())
+            buttons_message = {
+                "channel_id": channel.id,
+                "message_id": board.id,
+            }
+    else:
+        board = await channel.send(board_text(), view=build_view())
+        buttons_message = {
+            "channel_id": channel.id,
+            "message_id": board.id,
+        }
 
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=True, read_message_history=True, send_messages=False),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, read_message_history=True),
+    activity_message = old.get("activity-message")
+    activity_channel = (
+        guild.get_channel(activity_message["channel_id"])
+        if activity_message
+        else None
+    )
+    activity_list = active_sounds_lists.get(guild.id)
+    if activity_channel is not None and activity_message:
+        try:
+            activity_list = activity_list or ActiveSoundsList()
+            activity_list.message = await activity_channel.fetch_message(
+                activity_message["message_id"]
+            )
+        except discord.HTTPException:
+            activity_list = ActiveSoundsList()
+            activity_post = await activity_list.send(channel)
+            activity_message = {
+                "channel_id": channel.id,
+                "message_id": activity_post.id,
+            }
+    else:
+        activity_list = ActiveSoundsList()
+        activity_post = await activity_list.send(channel)
+        activity_message = {
+            "channel_id": channel.id,
+            "message_id": activity_post.id,
+        }
+    active_sounds_lists[guild.id] = activity_list
+
+    state[str(guild.id)] = {
+        "buttons-message": buttons_message,
+        "activity-message": activity_message,
     }
-    channel = await guild.create_text_channel(
-        "soundboard", overwrites=overwrites,
-        topic="Join a voice channel, then press a button to play a sound.")
-
-    msg = await channel.send(board_text(), view=build_view())
-
-    state[str(guild.id)] = {"channel_id": channel.id, "message_id": msg.id}
     save_json(STATE_FILE, state)
     await interaction.followup.send(
         f"Soundboard: {channel.mention} | Uploads: {add_ch.mention}")
@@ -628,7 +709,10 @@ async def on_message(message: discord.Message):
         return await message.reply(f"Limit of {MAX_SOUNDS} sounds reached. Use /removesound first.")
 
     entry = load_json(STATE_FILE, {}).get(str(message.guild.id))
-    if not entry:
+    buttons_message = entry.get("buttons-message") if entry else None
+    if buttons_message is None and entry and "message_id" in entry:
+        buttons_message = entry
+    if not buttons_message:
         return await message.reply("Run /setup first.")
 
     parts = message.content.strip().split(maxsplit=1)
@@ -650,7 +734,7 @@ async def on_message(message: discord.Message):
     # Add it and try to update the board; if Discord rejects the emoji, undo everything
     SOUNDS[emoji] = [label, filename]
     try:
-        await update_board(entry)
+        await update_board(buttons_message)
     except discord.HTTPException:
         SOUNDS.pop(emoji, None)
         try:
@@ -661,7 +745,7 @@ async def on_message(message: discord.Message):
             "That doesn't look like a valid emoji. Put it first in the message.")
 
     save_json(SOUNDS_FILE, SOUNDS)
-    await refresh_boards(skip_message_id=entry["message_id"])  # other servers
+    await refresh_boards(skip_message_id=buttons_message["message_id"])  # other servers
     await message.add_reaction("✅")
 
 
