@@ -1,0 +1,8 @@
+.env
+.git
+.gitignore
+data/
+data_test/
+__pycache__/
+venv/
+*.md
