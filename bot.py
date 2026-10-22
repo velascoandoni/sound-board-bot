@@ -1,24 +1,21 @@
 import os
 import re
 import json
-import array
-import queue
 import shutil
 import asyncio
-import threading
 import subprocess
-import math
-import time
-
-
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime
 
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
+
+from soundboard_bot.active_sounds_list import ActiveSoundsList
+from soundboard_bot.sound_bot import SoundBot
+from soundboard_bot.sound_button import SoundButton
+from soundboard_bot.sound_mixer import SoundMixer
+from soundboard_bot.stop_button import StopButton
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -80,153 +77,6 @@ def board_text():
 
 
 # ---------------------------------------------------------------------------
-# Audio mixer (lets several sounds play at the same time)
-# ---------------------------------------------------------------------------
-class SoundMixer(discord.AudioSource):
-    FRAME_BYTES = 3840  # 20 ms of 48 kHz stereo, 16-bit PCM
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.sources = []
-        self.closed = False
-
-    def add_sound(self, path, on_finished=None):
-        if self.closed:
-            raise RuntimeError("Mixer is closed")
-
-        process = subprocess.Popen(
-            [
-                FFMPEG_PATH or "ffmpeg",
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-i", str(path),
-                "-f", "s16le",
-                "-ar", "48000",
-                "-ac", "2",
-                "pipe:1",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=0,
-        )
-
-        source = {
-            "process": process,
-            "frames": queue.Queue(maxsize=10),
-            "on_finished": on_finished,
-        }
-
-        with self.lock:
-            if self.closed:
-                process.kill()
-                process.wait()
-                raise RuntimeError("Mixer is closed")
-            self.sources.append(source)
-
-        def read_audio():
-            frames = source["frames"]
-            try:
-                while not self.closed:
-                    chunk = process.stdout.read(self.FRAME_BYTES)
-                    if not chunk:
-                        break
-
-                    chunk = chunk.ljust(self.FRAME_BYTES, b"\0")
-
-                    while not self.closed:
-                        try:
-                            frames.put(chunk, timeout=0.1)
-                            break
-                        except queue.Full:
-                            continue
-            except (OSError, ValueError):
-                pass
-            finally:
-                while not self.closed:
-                    try:
-                        frames.put(None, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
-        threading.Thread(target=read_audio, daemon=True).start()
-
-    def read(self):
-        if self.closed:
-            return b""
-
-        with self.lock:
-            sources = list(self.sources)
-
-        mixed = array.array("h", [0] * (self.FRAME_BYTES // 2))
-        finished = []
-
-        for source in sources:
-            try:
-                frame = source["frames"].get_nowait()
-            except queue.Empty:
-                continue
-
-            if frame is None:
-                finished.append(source)
-                continue
-
-            samples = array.array("h")
-            samples.frombytes(frame)
-
-            for i, sample in enumerate(samples):
-                mixed[i] = max(-32768, min(32767, mixed[i] + sample))
-
-        with self.lock:
-            for source in finished:
-                if source in self.sources:
-                    self.sources.remove(source)
-                    process = source["process"]
-
-                    try:
-                        process.stdout.close()
-                    except (OSError, ValueError):
-                        pass
-
-                    try:
-                        process.wait(timeout=0.2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-
-                    callback = source.get("on_finished")
-                    if callback:
-                        callback()
-
-        return mixed.tobytes()
-
-    def is_opus(self):
-        return False
-
-    def stop_all(self):
-        with self.lock:
-            sources = list(self.sources)
-            self.sources.clear()
-
-        for source in sources:
-            try:
-                source["process"].kill()
-            except OSError:
-                pass
-
-    def cleanup(self):
-        with self.lock:
-            self.closed = True
-            sources = list(self.sources)
-            self.sources.clear()
-
-        for source in sources:
-            try:
-                source["process"].kill()
-            except OSError:
-                pass
-
-# ---------------------------------------------------------------------------
 # Playing Sounds message
 # ---------------------------------------------------------------------------
 
@@ -247,176 +97,6 @@ async def get_audio_duration(path: str) -> float:
     return float(result.stdout.strip())
 
 
-@dataclass
-class SoundRow:
-    """Represents one instance of a sound playback."""
-
-    id: str
-    name: str
-    user_id: int
-    duration_seconds: float
-    emoji: str = "🔊"
-    started_at: float = field(default_factory=time.monotonic)
-
-    @property
-    def elapsed_seconds(self) -> int:
-        now = datetime.now(timezone.utc)
-        return max(0, int((now - self.started_at).total_seconds()))
-
-    @property
-    def remaining_seconds(self) -> int:
-        elapsed = time.monotonic() - self.started_at
-        return max(0, math.ceil(self.duration_seconds - elapsed))
-
-    def format_duration(self) -> str:
-        seconds = self.remaining_seconds
-        minutes, seconds = divmod(seconds, 60)
-        return f"{minutes:02d}:{seconds:02d}"
-
-    def to_string(self) -> str:
-        return (
-            f"{self.emoji} **{self.name}**\n"
-            f"└  Played by <@{self.user_id}> · "
-            f"`{self.format_duration()}`"
-        )
-
-
-class ActiveSoundsList:
-    """Manages active sound rows and a persistent Discord embed."""
-
-    def __init__(
-        self,
-        title: str = "🔊 Sound Activity",
-        color: int = 0x5865F2,
-    ):
-        self.title = title
-        self.color = color
-
-        # Unique playback ID -> SoundRow
-        self.sounds: dict[str, SoundRow] = {}
-
-        self.message: Optional[discord.Message] = None
-        self._refresh_task: Optional[asyncio.Task] = None
-
-    async def _refresh_remaining(self):
-        loop = asyncio.get_running_loop()
-        interval = 1.0
-        next_tick = loop.time() + interval
-
-        try:
-            while self.sounds:
-                await asyncio.sleep(max(0, next_tick - loop.time()))
-
-                if self.sounds:
-                    await self.update()
-
-                next_tick += interval
-                now = loop.time()
-                if next_tick <= now:
-                    next_tick = now + interval
-        finally:
-            self._refresh_task = None
-
-    def add_sound(
-        self,
-        sound_id: str,
-        name: str,
-        user_id: int,
-        duration_seconds: float,
-        emoji: str = "🔊",
-    ) -> SoundRow:
-        """Add a sound to the active list."""
-        if sound_id in self.sounds:
-            raise ValueError(
-                f"Playback {sound_id!r} already exists."
-            )
-
-        row = SoundRow(
-            id=sound_id,
-            name=name,
-            user_id=user_id,
-            emoji=emoji,
-            duration_seconds=duration_seconds,
-        )
-        self.sounds[sound_id] = row
-        return row
-
-    def remove_sound(self, sound_id: str) -> bool:
-        """Remove a playback. Returns True if it existed."""
-        return self.sounds.pop(sound_id, None) is not None
-
-    def get_sound(self, sound_id: str) -> Optional[SoundRow]:
-        return self.sounds.get(sound_id)
-
-    def create_embed(self) -> discord.Embed:
-        embed = discord.Embed(
-            title=self.title,
-            color=self.color,
-            timestamp=datetime.now(timezone.utc),
-        )
-
-        if self.sounds:
-            description = "\n\n".join(
-                row.to_string() for row in self.sounds.values()
-            )
-
-            # Embed descriptions have a 4096-character limit.
-            suffix = "\n\n… More sounds omitted."
-            if len(description) > 4096:
-                description = (
-                    description[: 4096 - len(suffix)] + suffix
-                )
-
-            embed.description = description
-        else:
-            embed.description = "_No sounds are currently playing._"
-
-
-        return embed
-
-    async def send(self, channel: discord.abc.Messageable):
-        """Create the dashboard message."""
-        self.message = await channel.send(
-            embed=self.create_embed()
-        )
-        return self.message
-
-    async def update(self):
-        """Refresh the existing dashboard message."""
-        if self.message is None:
-            raise RuntimeError(
-                "Dashboard not sent yet. Call send(channel) first."
-            )
-
-        await self.message.edit(embed=self.create_embed())
-        return self.message
-
-    async def add_and_update(
-        self,
-        sound,
-        duration_seconds:float,
-        user_id:str,
-    ) -> SoundRow:
-        sound_id=str(datetime.now().timestamp())+sound[0]
-        self.add_sound(sound_id, sound[0],user_id,duration_seconds,sound[2])
-        await self.update()
-        
-        if self._refresh_task is None or self._refresh_task.done():
-            self._refresh_task = asyncio.create_task(self._refresh_remaining())
-        return sound_id
-
-    async def remove_and_update(self, sound_id: str) -> bool:
-        removed = self.remove_sound(sound_id)
-
-        if removed:
-            await self.update()
-
-        return removed
-    
-    async def remove_all_and_update(self) -> bool:
-        self.sounds.clear()
-        await self.update()
-
 # ---------------------------------------------------------------------------
 # Bot + buttons
 # ---------------------------------------------------------------------------
@@ -428,7 +108,7 @@ async def get_mixer(guild, vc):
     mixer = mixers.get(guild.id)
 
     if mixer is None or mixer.closed:
-        mixer = SoundMixer()
+        mixer = SoundMixer(FFMPEG_PATH or "ffmpeg")
         mixers[guild.id] = mixer
         vc.play(mixer)
 
@@ -486,87 +166,26 @@ async def play_sound(interaction: discord.Interaction, key: str):
         await interaction.followup.send("Could not play that sound.", ephemeral=True)
 
 
-class SoundButton(discord.ui.Button):
-    def __init__(self, key: str, label: str):
-        super().__init__(
-            style=discord.ButtonStyle.secondary,
-            label=label[:80],
-            emoji=key,
-            custom_id=f"sb:play:{key}",
-        )
-        self.key = key
-
-    async def callback(self, interaction: discord.Interaction):
-        await play_sound(interaction, self.key)
-
-
-class StopButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(
-            style=discord.ButtonStyle.danger,
-            label="Stop",
-            emoji=STOP_EMOJI,
-            custom_id="sb:stop",
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        mixer = mixers.get(interaction.guild.id)
-        if mixer:
-            mixer.stop_all()
-        activity_list = active_sounds_lists.get(interaction.guild.id)
-        if activity_list:
-            await activity_list.remove_all_and_update()
-        await interaction.response.defer()  # silent acknowledge
+async def stop_sounds(interaction: discord.Interaction):
+    mixer = mixers.get(interaction.guild.id)
+    if mixer:
+        mixer.stop_all()
+    activity_list = active_sounds_lists.get(interaction.guild.id)
+    if activity_list:
+        await activity_list.remove_all_and_update()
+    await interaction.response.defer()
 
 
 def build_view():
     view = discord.ui.View(timeout=None)  # timeout=None -> buttons never expire
-    view.add_item(StopButton())
+    view.add_item(StopButton(stop_sounds, STOP_EMOJI))
     for key, sound_data in SOUNDS.items():
-        view.add_item(SoundButton(key, sound_data[0]))
+        view.add_item(SoundButton(key, sound_data[0], play_sound))
     return view
 
 
-class SoundBot(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True  # needed to read uploads
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        for guild_id, entry in load_json(STATE_FILE, {}).items():
-            buttons_message = entry.get("buttons-message")
-            if buttons_message is None and "message_id" in entry:
-                buttons_message = entry
-            if buttons_message:
-                self.add_view(
-                    build_view(),
-                    message_id=buttons_message["message_id"],
-                )
-
-            activity_message = entry.get("activity-message")
-            if activity_message:
-                try:
-                    channel = self.get_channel(activity_message["channel_id"])
-                    if channel is None:
-                        channel = await self.fetch_channel(
-                            activity_message["channel_id"]
-                        )
-                    activity_list = ActiveSoundsList()
-                    activity_list.message = channel.get_partial_message(
-                        activity_message["message_id"]
-                    )
-                    active_sounds_lists[int(guild_id)] = activity_list
-                except discord.HTTPException as err:
-                    print(f"Could not restore activity message: {err}")
-
-
-bot = SoundBot()
-
-
 active_sounds_lists = {}
+bot = SoundBot(build_view, STATE_FILE, load_json, active_sounds_lists)
 
 
 async def update_board(entry):
