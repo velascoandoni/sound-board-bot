@@ -8,6 +8,12 @@ import asyncio
 import threading
 import subprocess
 
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -56,10 +62,10 @@ def norm(e: str) -> str:
 
 SOUNDS = load_json(SOUNDS_FILE, {})  # emoji -> [label, filename]
 
-
 def find_sound(emoji: str):
     for e, v in SOUNDS.items():
         if norm(e) == norm(emoji):
+            v.append(e)
             return v
     return None
 
@@ -142,7 +148,6 @@ class SoundMixer(discord.AudioSource):
                         break
                     except queue.Full:
                         continue
-
         threading.Thread(target=read_audio, daemon=True).start()
 
     def read(self):
@@ -220,7 +225,153 @@ class SoundMixer(discord.AudioSource):
             except OSError:
                 pass
 
+# ---------------------------------------------------------------------------
+# Playing Sounds message
+# ---------------------------------------------------------------------------
 
+
+
+
+@dataclass
+class SoundRow:
+    """Represents one instance of a sound playback."""
+
+    id: str
+    name: str
+    user_id: int
+    emoji: str = "🔊"
+    started_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    @property
+    def elapsed_seconds(self) -> int:
+        now = datetime.now(timezone.utc)
+        return max(0, int((now - self.started_at).total_seconds()))
+
+    def format_duration(self) -> str:
+        seconds = self.elapsed_seconds
+        minutes, seconds = divmod(seconds, 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def to_string(self) -> str:
+        return (
+            f"{self.emoji} **{self.name}**\n"
+            f"└ Played by <@{self.user_id}> · "
+            f"`{self.format_duration()}`"
+        )
+
+
+class ActiveSoundsList:
+    """Manages active sound rows and a persistent Discord embed."""
+
+    def __init__(
+        self,
+        title: str = "🔊 Sound Activity",
+        color: int = 0x5865F2,
+    ):
+        self.title = title
+        self.color = color
+
+        # Unique playback ID -> SoundRow
+        self.sounds: dict[str, SoundRow] = {}
+
+        self.message: Optional[discord.Message] = None
+
+    def add_sound(
+        self,
+        sound_id: str,
+        name: str,
+        user_id: int,
+        emoji: str = "🔊",
+    ) -> SoundRow:
+        """Add a sound to the active list."""
+        if sound_id in self.sounds:
+            raise ValueError(
+                f"Playback {sound_id!r} already exists."
+            )
+
+        row = SoundRow(
+            id=sound_id,
+            name=name,
+            user_id=user_id,
+            emoji=emoji,
+        )
+        self.sounds[sound_id] = row
+        return row
+
+    def remove_sound(self, sound_id: str) -> bool:
+        """Remove a playback. Returns True if it existed."""
+        return self.sounds.pop(sound_id, None) is not None
+
+    def get_sound(self, sound_id: str) -> Optional[SoundRow]:
+        return self.sounds.get(sound_id)
+
+    def create_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=self.title,
+            color=self.color,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        if self.sounds:
+            description = "\n\n".join(
+                row.to_string() for row in self.sounds.values()
+            )
+
+            # Embed descriptions have a 4096-character limit.
+            suffix = "\n\n… More sounds omitted."
+            if len(description) > 4096:
+                description = (
+                    description[: 4096 - len(suffix)] + suffix
+                )
+
+            embed.description = description
+        else:
+            embed.description = "_No sounds are currently playing._"
+
+        count = len(self.sounds)
+        embed.set_footer(
+            text=f"{count} active sound{'s' if count != 1 else ''}"
+        )
+
+        return embed
+
+    async def send(self, channel: discord.abc.Messageable):
+        """Create the dashboard message."""
+        self.message = await channel.send(
+            embed=self.create_embed()
+        )
+        return self.message
+
+    async def update(self):
+        """Refresh the existing dashboard message."""
+        if self.message is None:
+            raise RuntimeError(
+                "Dashboard not sent yet. Call send(channel) first."
+            )
+
+        await self.message.edit(embed=self.create_embed())
+        return self.message
+
+    async def add_and_update(
+        self,
+        sound
+    ) -> SoundRow:
+        sound_id=str(datetime.now().timestamp())+sound[0]
+        row = self.add_sound(sound_id, sound[0],None,sound[2])
+        await self.update()
+        return sound_id
+
+    async def remove_and_update(self, sound_id: str) -> bool:
+        removed = self.remove_sound(sound_id)
+
+        if removed:
+            await self.update()
+
+        return removed
+
+active_sounds_list= ActiveSoundsList()
 # ---------------------------------------------------------------------------
 # Bot + buttons
 # ---------------------------------------------------------------------------
@@ -266,11 +417,18 @@ async def play_sound(interaction: discord.Interaction, key: str):
             vc = guild.voice_client
             if vc is None:
                 vc = await member.voice.channel.connect()
+                entry=load_json(STATE_FILE, {}).get(str(guild.id))
+                await active_sounds_list.send(bot.get_channel(entry["channel_id"]))
             elif vc.channel != member.voice.channel:
                 await vc.move_to(member.voice.channel)
             mixer = await get_mixer(guild, vc)
-
-        await asyncio.to_thread(mixer.add_sound, path,on_finished)
+        sound_id= await active_sounds_list.add_and_update(sound)
+        
+        async def on_finished():
+            await active_sounds_list.remove_and_update(sound_id)
+        def schedule_on_finished():
+            asyncio.run_coroutine_threadsafe(on_finished(), loop)
+        await asyncio.to_thread(mixer.add_sound, path,on_finished=schedule_on_finished)
 
     except (OSError, RuntimeError, asyncio.TimeoutError, discord.ClientException) as err:
         print(f"Could not play sound: {err}")
