@@ -7,6 +7,8 @@ import shutil
 import asyncio
 import threading
 import subprocess
+import math
+import time
 
 
 from dataclasses import dataclass, field
@@ -229,7 +231,21 @@ class SoundMixer(discord.AudioSource):
 # Playing Sounds message
 # ---------------------------------------------------------------------------
 
-
+async def get_audio_duration(path: str) -> float:
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return float(result.stdout.strip())
 
 
 @dataclass
@@ -239,25 +255,29 @@ class SoundRow:
     id: str
     name: str
     user_id: int
+    duration_seconds: float
     emoji: str = "🔊"
-    started_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    started_at: float = field(default_factory=time.monotonic)
 
     @property
     def elapsed_seconds(self) -> int:
         now = datetime.now(timezone.utc)
         return max(0, int((now - self.started_at).total_seconds()))
 
+    @property
+    def remaining_seconds(self) -> int:
+        elapsed = time.monotonic() - self.started_at
+        return max(0, math.ceil(self.duration_seconds - elapsed))
+
     def format_duration(self) -> str:
-        seconds = self.elapsed_seconds
+        seconds = self.remaining_seconds
         minutes, seconds = divmod(seconds, 60)
         return f"{minutes:02d}:{seconds:02d}"
 
     def to_string(self) -> str:
         return (
             f"{self.emoji} **{self.name}**\n"
-            f"└ Played by <@{self.user_id}> · "
+            f"└  Played by <@{self.user_id}> · "
             f"`{self.format_duration()}`"
         )
 
@@ -277,12 +297,33 @@ class ActiveSoundsList:
         self.sounds: dict[str, SoundRow] = {}
 
         self.message: Optional[discord.Message] = None
+        self._refresh_task: Optional[asyncio.Task] = None
+
+    async def _refresh_remaining(self):
+        loop = asyncio.get_running_loop()
+        interval = 1.0
+        next_tick = loop.time() + interval
+
+        try:
+            while self.sounds:
+                await asyncio.sleep(max(0, next_tick - loop.time()))
+
+                if self.sounds:
+                    await self.update()
+
+                next_tick += interval
+                now = loop.time()
+                if next_tick <= now:
+                    next_tick = now + interval
+        finally:
+            self._refresh_task = None
 
     def add_sound(
         self,
         sound_id: str,
         name: str,
         user_id: int,
+        duration_seconds: float,
         emoji: str = "🔊",
     ) -> SoundRow:
         """Add a sound to the active list."""
@@ -296,6 +337,7 @@ class ActiveSoundsList:
             name=name,
             user_id=user_id,
             emoji=emoji,
+            duration_seconds=duration_seconds,
         )
         self.sounds[sound_id] = row
         return row
@@ -330,10 +372,6 @@ class ActiveSoundsList:
         else:
             embed.description = "_No sounds are currently playing._"
 
-        count = len(self.sounds)
-        embed.set_footer(
-            text=f"{count} active sound{'s' if count != 1 else ''}"
-        )
 
         return embed
 
@@ -356,11 +394,16 @@ class ActiveSoundsList:
 
     async def add_and_update(
         self,
-        sound
+        sound,
+        duration_seconds:float,
+        user_id:str,
     ) -> SoundRow:
         sound_id=str(datetime.now().timestamp())+sound[0]
-        row = self.add_sound(sound_id, sound[0],None,sound[2])
+        self.add_sound(sound_id, sound[0],user_id,duration_seconds,sound[2])
         await self.update()
+        
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._refresh_remaining())
         return sound_id
 
     async def remove_and_update(self, sound_id: str) -> bool:
@@ -426,7 +469,8 @@ async def play_sound(interaction: discord.Interaction, key: str):
             elif vc.channel != member.voice.channel:
                 await vc.move_to(member.voice.channel)
             mixer = await get_mixer(guild, vc)
-        sound_id= await active_sounds_list.add_and_update(sound)
+        duration_seconds = await get_audio_duration(path)
+        sound_id= await active_sounds_list.add_and_update(sound,duration_seconds,member.id)
         loop = asyncio.get_running_loop()
 
         async def on_finished():
