@@ -37,6 +37,7 @@ MAX_BYTES = 8 * 1024 * 1024
 EXTENSIONS = (".mp3", ".wav", ".ogg")
 
 STOP_EMOJI = "✖️"
+VOICE_IDLE_TIMEOUT = 5
 
 # First run: seed data/ from defaults/ (only if the sound list doesn't exist yet)
 if not os.path.exists(SOUNDS_FILE):
@@ -382,6 +383,7 @@ class ActiveSoundsList:
 # ---------------------------------------------------------------------------
 mixers = {}
 voice_locks = {}
+voice_idle_tasks = {}
 
 
 async def get_mixer(guild, vc):
@@ -555,6 +557,58 @@ async def refresh_boards(skip_message_id=None):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+):
+    if member.bot:
+        return
+
+    guild = member.guild
+    vc = guild.voice_client
+    if vc is None or (before.channel != vc.channel and after.channel != vc.channel):
+        return
+
+    idle_task = voice_idle_tasks.get(guild.id)
+    if any(not channel_member.bot for channel_member in vc.channel.members):
+        if idle_task is not None:
+            idle_task.cancel()
+            voice_idle_tasks.pop(guild.id, None)
+        return
+
+    if idle_task is not None and not idle_task.done():
+        return
+
+    async def disconnect_when_idle(channel):
+        try:
+            await asyncio.sleep(VOICE_IDLE_TIMEOUT)
+            async with voice_locks.setdefault(guild.id, asyncio.Lock()):
+                current_vc = guild.voice_client
+                if (
+                    current_vc is not None
+                    and current_vc.channel == channel
+                    and not any(
+                        not channel_member.bot
+                        for channel_member in current_vc.channel.members
+                    )
+                ):
+                    mixer = mixers.pop(guild.id, None)
+                    if mixer:
+                        mixer.cleanup()
+                    await current_vc.disconnect()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if voice_idle_tasks.get(guild.id) is asyncio.current_task():
+                voice_idle_tasks.pop(guild.id, None)
+
+    voice_idle_tasks[guild.id] = asyncio.create_task(
+        disconnect_when_idle(vc.channel)
+    )
 
 
 @bot.tree.command(name="setup", description="Create the soundboard and add-sounds channels")
