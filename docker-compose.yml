@@ -1,6 +1,6 @@
 services:
   soundbot:
-    image: ghcr.io/YOUR_USER/YOUR_REPO:latest
+    image: .
     build: .
     restart: unless-stopped
     env_file: .env
