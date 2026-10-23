@@ -1,6 +1,5 @@
 services:
   soundbot:
-    image: .
     build: .
     restart: unless-stopped
     env_file: .env
