@@ -1,11 +1,8 @@
 services:
   soundbot:
+    image: ghcr.io/YOUR_USER/YOUR_REPO:latest
     build: .
     restart: unless-stopped
     env_file: .env
     volumes:
-      # Uploaded sounds, sounds.json and state.json survive restarts and updates
-      - soundbot-data:/app/data
-
-volumes:
-  soundbot-data:
+      - ./data:/app/data
