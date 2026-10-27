@@ -1,7 +1,53 @@
 # Discord Soundboard Bot
 
-A soundboard bot: a channel with one message full of buttons, press a button to play a sound in your voice channel.
-Upload new sounds by posting an audio file in `#add-sounds`.
+<p align="center">
+  <img src="readme-assets/logo.png" alt="Soundboard Bot logo" width="260">
+</p>
+
+<p align="center">
+  <img alt="License" src="https://img.shields.io/badge/License-GPL%20v3-blue">
+  <img alt="Discord" src="https://img.shields.io/badge/Discord-Bot-5865F2">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB">
+</p>
+
+A Discord bot that lets a voice channel play short sound clips from animated emoji buttons.
+
+## How it works
+
+### 1. Run /setup
+
+`/setup` creates the `#soundboard` and `#add-sounds` channels for your server.
+
+![Setup command](readme-assets/setup.jpg)
+![Setup result](readme-assets/setup-msg.jpg)
+
+### 2. Add sounds
+
+Upload an `.mp3`, `.wav` or `.ogg` file in `#add-sounds` with an emoji first in the message, for example `😸 CAT LAUGH`.
+
+![Add sounds](readme-assets/add-sound.jpg)
+
+### 3. Use the soundboard
+
+Join a voice channel, open `#soundboard`, and press a sound button to play it.
+
+![Soundboard](readme-assets/soundboard.jpg)
+
+### 4. Remove sounds
+
+`/removesound` shows a list of current sounds and allows you to delete one
+
+![Remove sounds](readme-assets/removesound.png)
+
+![Remove sounds response](readme-assets/removesound-msg.png)
+
+
+### 5. Leave
+
+
+`/leave` forces the bot to leave the voice chat. If nobody is present for 5 seconds it will leave on its own, this command just forces it lo leave even with people in it.
+
+---
 
 ## 1. Create the Discord bot
 
@@ -15,7 +61,7 @@ Upload new sounds by posting an audio file in `#add-sounds`.
 
 ## 2. Run it (Docker)
 
-```
+```bash
 git clone https://github.com/YOUR_USER/YOUR_REPO.git
 cd YOUR_REPO
 cp .env.example .env        # then edit .env and paste your token
@@ -24,17 +70,14 @@ docker compose up -d --build
 
 Then run `/setup` in your Discord server once.
 
-| Task            | Command                                   |
-|-----------------|-------------------------------------------|
-| View logs       | `docker compose logs -f`                  |
-| Update          | `git pull && docker compose up -d --build`|
-| Stop            | `docker compose down`                     |
+| Task            | Command                                     |
+|-----------------|---------------------------------------------|
+| View logs       | `docker compose logs -f`                    |
+| Update          | `git pull && docker compose up -d --build`  |
+| Stop            | `docker compose down`                       |
 
 Uploaded sounds and state are stored in the `soundbot-data` Docker volume, so they survive updates.
 
-## 3. Using it
+## License
 
-- `/setup` creates `#soundboard` and `#add-sounds` (needs Manage Channels).
-- Upload an `.mp3`, `.wav` or `.ogg` in `#add-sounds` with an emoji first in the message, e.g. `🦆 Quack`.
-- `/removesound` deletes a sound, `/leave` disconnects the bot from voice.
-- Up to 24 sounds per server.
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0). See [LICENSE](LICENSE) for details.
