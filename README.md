@@ -62,8 +62,8 @@ Join a voice channel, open `#soundboard`, and press a sound button to play it.
 ## 2. Run it (Docker)
 
 ```bash
-git clone https://github.com/YOUR_USER/YOUR_REPO.git
-cd YOUR_REPO
+git clone https://github.com/velascoandoni/sound-board-bot.git
+cd sound-board-bot
 cp .env.example .env        # then edit .env and paste your token
 docker compose up -d --build
 ```
