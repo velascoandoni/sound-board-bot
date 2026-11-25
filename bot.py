@@ -141,14 +141,22 @@ class SoundMixer(discord.AudioSource):
  
         def read_audio():
             frames = source["frames"]
+            total = 0
+            peak = 0
             try:
                 while not self.closed:
                     chunk = process.stdout.read(self.FRAME_BYTES)
                     if not chunk:
                         break
- 
+
+                    total += len(chunk)
+                    samples = array.array("h")
+                    samples.frombytes(chunk[: len(chunk) // 2 * 2])
+                    if samples:
+                        peak = max(peak, max(samples), -min(samples))
+
                     chunk = chunk.ljust(self.FRAME_BYTES, b"\0")
- 
+
                     while not self.closed:
                         try:
                             frames.put(chunk, timeout=0.1)
@@ -158,12 +166,19 @@ class SoundMixer(discord.AudioSource):
             except (OSError, ValueError):
                 pass
             finally:
+                try:
+                    err = process.stderr.read().decode(errors="replace").strip()
+                except (OSError, ValueError):
+                    err = ""
+                print(f"[mixer] {os.path.basename(str(path))}: {total} bytes, "
+                      f"peak={peak}, ffmpeg rc={process.poll()} {err}", flush=True)
                 while not self.closed:
                     try:
                         frames.put(None, timeout=0.1)
                         break
                     except queue.Full:
                         continue
+        
         threading.Thread(target=read_audio, daemon=True).start()
  
     def read(self):
