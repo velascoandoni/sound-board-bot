@@ -84,7 +84,16 @@ def board_text():
         f"Press {STOP_EMOJI} **Stop** to silence everything."
     )
  
- 
+def pause_if_idle(guild_id):
+    guild = bot.get_guild(guild_id)
+    vc = guild.voice_client if guild else None
+    mixer = mixers.get(guild_id)
+    if vc is None or mixer is None or mixer.closed:
+        return
+    with mixer.lock:
+        idle = not mixer.sources
+    if idle and not vc.is_paused():
+        vc.pause()
 # ---------------------------------------------------------------------------
 # Audio mixer (lets several sounds play at the same time)
 # ---------------------------------------------------------------------------
@@ -113,10 +122,10 @@ class SoundMixer(discord.AudioSource):
                 "pipe:1",
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=0,
         )
- 
+    
         source = {
             "process": process,
             "frames": queue.Queue(maxsize=10),
@@ -232,7 +241,7 @@ class SoundMixer(discord.AudioSource):
             except OSError:
                 pass
  
- 
+
 # ---------------------------------------------------------------------------
 # Playing Sounds message
 # ---------------------------------------------------------------------------
@@ -429,6 +438,7 @@ async def get_mixer(guild, vc):
         mixer = SoundMixer()
         mixers[guild.id] = mixer
         vc.play(mixer)
+        vc.pause()
  
     return mixer
  
@@ -453,7 +463,9 @@ async def play_sound(interaction: discord.Interaction, key: str):
  
     # Acknowledge right away: connecting to voice can take longer than 3 seconds
     await interaction.response.defer()
- 
+
+
+
     guild = interaction.guild
  
     # With the activity bot disabled there is no list; sounds still play.
@@ -473,19 +485,25 @@ async def play_sound(interaction: discord.Interaction, key: str):
                 await vc.move_to(member.voice.channel)
             mixer = await get_mixer(guild, vc)
  
-        on_finished_cb = None
+        loop = asyncio.get_running_loop()
+        finished_id = None
+
         if activity_list is not None:
             duration_seconds = await get_audio_duration(path)
             sound_id = await activity_list.add_and_update(
                 sound, duration_seconds, member.id)
-            loop = asyncio.get_running_loop()
             finished_id = sound_id
- 
-            def on_finished_cb():
+
+        def on_finished_cb():
+            # Runs on the AUDIO thread with the mixer lock held, so only hand off.
+            loop.call_soon_threadsafe(pause_if_idle, guild.id)
+            if activity_list is not None:
                 asyncio.run_coroutine_threadsafe(
                     activity_list.remove_and_update(finished_id), loop)
- 
+
         await asyncio.to_thread(mixer.add_sound, path, on_finished=on_finished_cb)
+        if vc.is_paused():
+            vc.resume()
  
     except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError,
             asyncio.TimeoutError, discord.ClientException) as err:
@@ -522,6 +540,8 @@ class StopButton(discord.ui.Button):
         mixer = mixers.get(interaction.guild.id)
         if mixer:
             mixer.stop_all()
+            pause_if_idle(interaction.guild.id)
+
         activity_list = active_sounds_lists.get(interaction.guild.id)
         if activity_list:
             await activity_list.remove_all_and_update()
