@@ -868,42 +868,61 @@ async def setup(interaction: discord.Interaction):
         f"Soundboard: {channel.mention} | Uploads: {add_ch.mention}{note}")
  
  
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-    if message.channel.name != ADD_CHANNEL or not message.attachments:
-        return
- 
-    att = next((a for a in message.attachments if a.filename.lower().endswith(EXTENSIONS)), None)
-    if not att:
-        return await message.reply("Attach an .mp3, .wav or .ogg file.")
-    if att.size > MAX_BYTES:
-        return await message.reply("File too large (max 8 MB).")
-    if len(SOUNDS) >= MAX_SOUNDS:
-        return await message.reply(f"Limit of {MAX_SOUNDS} sounds reached. Use /removesound first.")
- 
-    entry = load_json(STATE_FILE, {}).get(str(message.guild.id))
-    buttons_message = get_buttons_message(entry)
-    if not buttons_message:
-        return await message.reply("Run /setup first.")
- 
-    parts = message.content.strip().split(maxsplit=1)
+# Replace your existing `on_message` handler with everything in this file.
+#
+# It relies on names you already have in bot.py: os, re, discord, bot, SOUNDS,
+# SOUNDS_DIR, SOUNDS_FILE, STATE_FILE, ADD_CHANNEL, MAX_SOUNDS, MAX_BYTES,
+# EXTENSIONS, STOP_EMOJI, norm, load_json, save_json, get_buttons_message,
+# update_board and refresh_boards.
+
+# Reply to an old upload with one of these words to restore it exactly as it was.
+RESTORE_WORDS = {"+", "readd", "re-add", "restore", "again"}
+
+
+def find_audio_attachment(message):
+    return next(
+        (a for a in message.attachments if a.filename.lower().endswith(EXTENSIONS)),
+        None,
+    )
+
+
+def parse_upload_text(text):
+    """'🦆 Quack' -> ('🦆', 'Quack'); '🦆' -> ('🦆', None); '' -> (None, None)."""
+    parts = (text or "").strip().split(maxsplit=1)
     if not parts:
-        return await message.reply("Put an emoji first in the message, e.g. `🦆 Quack`.")
- 
-    emoji = parts[0]
-    label = (parts[1] if len(parts) > 1 else os.path.splitext(att.filename)[0])[:40]
+        return None, None
+    return parts[0], (parts[1] if len(parts) > 1 else None)
+
+
+async def add_sound_from_attachment(message, att, emoji, label, buttons_message):
+    """Save the attachment and add its button.
+    Replies with the reason and returns False if it can't be added."""
+    if att.size > MAX_BYTES:
+        await message.reply("File too large (max 8 MB).")
+        return False
+    if len(SOUNDS) >= MAX_SOUNDS:
+        await message.reply(
+            f"Limit of {MAX_SOUNDS} sounds reached. Use /removesound first.")
+        return False
+
     used = {norm(e) for e in SOUNDS} | {norm(STOP_EMOJI)}
     if norm(emoji) in used:
-        return await message.reply(f"{emoji} is already used.")
- 
-    filename = re.sub(r"[^\w\-.]", "_", att.filename)
-    if os.path.exists(os.path.join(SOUNDS_DIR, filename)):
-        filename = f"{len(SOUNDS)}_{filename}"
+        await message.reply(
+            f"{emoji} is already on the board. Reply with a different emoji "
+            "(and optional name), e.g. `🦆 Quack`.")
+        return False
+
+    label = (label or os.path.splitext(att.filename)[0])[:40]
+
+    base = re.sub(r"[^\w\-.]", "_", att.filename)
+    filename = base
+    n = 1
+    while os.path.exists(os.path.join(SOUNDS_DIR, filename)):
+        filename = f"{n}_{base}"
+        n += 1
     path = os.path.join(SOUNDS_DIR, filename)
     await att.save(path)
- 
+
     # Add it and try to update the board; if Discord rejects the emoji, undo everything
     SOUNDS[emoji] = [label, filename]
     try:
@@ -914,13 +933,67 @@ async def on_message(message: discord.Message):
             os.remove(path)
         except OSError:
             pass
-        return await message.reply(
+        await message.reply(
             "That doesn't look like a valid emoji. Put it first in the message.")
- 
+        return False
+
     save_json(SOUNDS_FILE, SOUNDS)
     await refresh_boards(skip_message_id=buttons_message["message_id"])  # other servers
     await message.add_reaction("✅")
- 
+    return True
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+    if message.channel.name != ADD_CHANNEL:
+        return
+
+    entry = load_json(STATE_FILE, {}).get(str(message.guild.id))
+    buttons_message = get_buttons_message(entry)
+
+    # ---- Case 1: a reply to an old upload -> bring that sound back ---------
+    if message.reference and message.reference.message_id and not message.attachments:
+        try:
+            # Fetch it (instead of using the cached copy) so the file link is fresh
+            old = await message.channel.fetch_message(message.reference.message_id)
+        except discord.HTTPException:
+            return
+        att = find_audio_attachment(old)
+        if att is None:
+            return  # replying to something that isn't an upload: ignore
+        if not buttons_message:
+            return await message.reply("Run /setup first.")
+
+        reply_emoji, reply_label = parse_upload_text(message.content)
+        if reply_emoji is None or message.content.strip().lower() in RESTORE_WORDS:
+            # Reuse the emoji and name written on the original upload
+            emoji, label = parse_upload_text(old.content)
+            if emoji is None:
+                return await message.reply(
+                    "The original upload has no emoji. Reply with one, e.g. `🦆 Quack`.")
+        else:
+            emoji, label = reply_emoji, reply_label
+
+        await add_sound_from_attachment(message, att, emoji, label, buttons_message)
+        return
+
+    # ---- Case 2: a new upload ---------------------------------------------
+    if not message.attachments:
+        return
+
+    att = find_audio_attachment(message)
+    if att is None:
+        return await message.reply("Attach an .mp3, .wav or .ogg file.")
+    if not buttons_message:
+        return await message.reply("Run /setup first.")
+
+    emoji, label = parse_upload_text(message.content)
+    if emoji is None:
+        return await message.reply("Put an emoji first in the message, e.g. `🦆 Quack`.")
+
+    await add_sound_from_attachment(message, att, emoji, label, buttons_message)
  
 async def remove_autocomplete(interaction: discord.Interaction, current: str):
     return [
